@@ -1,0 +1,153 @@
+你是一名 DevOps 工程师。请为当前仓库初始化一套自托管部署框架。
+
+这份框架的目标是：本地开发 → push 到 GitHub → PR 合并到 prod → GitHub Actions 
+通过 SSH 触发远程服务器上的部署脚本 → 服务器按项目自己的方式运行应用。
+
+框架只负责“触发和调用”，不关心项目具体怎么构建、怎么运行。
+具体部署逻辑必须封装在远程服务器的 /srv/<app>/deploy.sh 里。
+
+======================================================================
+一、硬性约束（不可更改）
+======================================================================
+
+1. 分支模型：
+   - main：集成分支，日常 PR 合入，跑 CI。
+   - prod：发布分支，受保护，只允许从 main 发 PR 合并。
+   - feature/*：功能分支，从 main 拉出，PR 回 main。
+
+2. 远程部署目录统一为：/srv/<app>/
+   其中 <app> 由项目决定，下文用 <app> 占位。
+
+3. 远程部署入口统一为：/srv/<app>/deploy.sh
+   - 由 deploy 用户执行
+   - 接收一个参数：要部署的 Git ref（默认 prod）
+   - 幂等，可重复执行
+   - 失败必须非 0 退出
+   - 具体内容由项目自行定义，框架不预设
+
+4. GitHub Actions 只做三件事：
+   a. （可选）构建并推送产物到镜像仓库 / Release / 对象存储
+   b. SSH 到远程服务器
+   c. 执行 /srv/<app>/deploy.sh <ref>
+   Actions 不得包含任何项目特定的构建或运行命令。
+
+5. 配置与密钥分离：
+   - 密钥一律通过 GitHub Secrets 注入
+   - 运行时环境变量放在服务器 /srv/<app>/app.env
+   - 部署脚本随仓库版本管理，路径固定为 deploy/deploy.sh
+
+======================================================================
+二、需要你产出的内容
+======================================================================
+
+请依次创建或说明以下内容：
+
+【1】分支与保护策略说明
+    - main / prod / feature/* 的用途与合并规则
+    - 建议在 GitHub 上开启的保护规则（文字说明即可）
+
+【2】仓库目录结构
+    必须包含：
+    .
+    ├── .github/workflows/
+    │   ├── ci.yml
+    │   └── deploy-prod.yml
+    ├── deploy/
+    │   └── deploy.sh
+    ├── .dockerignore（若使用 Docker）
+    ├── Dockerfile（若使用 Docker，可选）
+    └── <项目原有目录>
+
+【3】CI 工作流：.github/workflows/ci.yml
+    - 触发：PR 到 main 或 prod，以及 push 到 main
+    - 步骤：检出、安装依赖、跑测试、跑构建
+    - 语言相关命令请根据仓库实际技术栈填充
+
+【4】部署工作流：.github/workflows/deploy-prod.yml
+    必须满足：
+    - 触发：push 到 prod，以及 workflow_dispatch（可输入 ref）
+    - 权限：contents: read, packages: write
+    - 阶段一（可选）：构建产物并推送。
+      仅当仓库变量 DEPLOY_MODE == "image" 时执行。
+      用 docker/build-push-action 推送到 ghcr.io，打两个 tag：
+        - prod
+        - sha-<short>
+    - 阶段二（必选）：
+      * 使用 appleboy/scp-action 把 deploy/deploy.sh 上传到 /srv/<app>/
+      * 使用 appleboy/ssh-action 执行：
+          chmod +x /srv/<app>/deploy.sh
+          /srv/<app>/deploy.sh "${{ github.event.inputs.ref || 'prod' }}"
+      * environment 设为 production（用于人工审批）
+    - 阶段二必须在阶段一成功或被跳过时才执行
+
+【5】部署脚本模板：deploy/deploy.sh
+    结构要求：
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REF="${1:-prod}"
+    APP_DIR="/srv/<app>"
+    cd "$APP_DIR"
+    echo "[deploy] ref=$REF dir=$APP_DIR"
+    # ===== 项目自定义部署逻辑 =====
+    # 在这里实现：拉取代码、安装依赖、构建、重启服务等
+    # ============================
+    echo "[deploy] done"
+
+    请勿在此脚本中写入任何项目特定逻辑，只保留骨架和注释。
+
+【6】服务器初始化脚本：scripts/bootstrap-server.sh
+    要求：
+    - 创建 /srv/<app> 目录，归属 deploy:deploy，权限 750
+    - 创建 deploy 系统用户（若不存在）
+    - 将 deploy 加入 docker 组（若使用 Docker）
+    - 打印后续需要手工完成的步骤（authorized_keys、.env 等）
+
+【7】GitHub 配置清单
+    列出需要在 GitHub 仓库设置的：
+    - Secrets：SSH_HOST、SSH_USER、SSH_KEY、SSH_PORT、GHCR_TOKEN（如需）
+    - Variables：DEPLOY_MODE（image 或其他）
+    - Environment：production（要求人工审批）
+    - 分支保护规则：main、prod
+
+【8】配置与密钥放置说明
+    用表格说明每个变量放在哪里：
+    | 变量 | 位置 | 用途 |
+    包含：SSH 凭据、镜像仓库凭据、应用运行时环境变量、
+    Compose 变量、DEPLOY_MODE 等。
+
+【9】回滚机制说明
+    - 通过 workflow_dispatch 输入 ref 回滚
+    - 通过 deploy.sh <ref> 手动回滚
+    - 说明镜像 tag（sha-<short>）的保留策略
+
+【10】README-deploy.md
+    放在仓库根目录，内容包括：
+    - 部署架构图（ASCII）
+    - 首次部署步骤
+    - 日常发布流程
+    - 回滚流程
+    - 常见问题排查
+
+======================================================================
+三、输出要求
+======================================================================
+
+- 所有文件使用项目实际使用的技术栈（先识别仓库语言与框架）。
+- 若项目使用 Docker，同时产出 Dockerfile 与 .dockerignore；
+  若项目不使用 Docker，跳过并注明。
+- Actions 中所有 <app> 替换为实际应用名（可用仓库名推导）。
+- 不引入除 appleboy/ssh-action、appleboy/scp-action、docker/* 之外的第三方 Action。
+- 所有 YAML 必须可直接使用，不要有 TODO 占位符（除 deploy.sh 的部署逻辑外）。
+- 完成后，输出一份 checklist，说明哪些步骤需要人工在 GitHub 和服务器上完成。
+
+======================================================================
+四、非目标（明确不做）
+======================================================================
+
+- 不规定应用用什么语言、什么框架
+- 不规定用 systemd / pm2 / Docker / 裸进程
+- 不规定构建产物形式（镜像 / 二进制 / 静态文件）
+- 不实现具体部署逻辑，只留 deploy.sh 骨架
+- 不引入 Kubernetes、Terraform、Ansible 等额外工具
+
+这些全部由项目在 deploy/deploy.sh 中自行决定。
